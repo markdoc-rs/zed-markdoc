@@ -1,0 +1,20 @@
+[package]
+name = "zed-markdoc"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/markdoc-rs/zed-markdoc"
+publish = false
+
+# Its own workspace. See the note on `[lib]` below.
+[workspace]
+
+# Zed loads extensions as WebAssembly components, so this is a cdylib and is
+# NOT a member of the workspace above: it builds for wasm32-wasip2 with its
+# own dependency set, and including it would put that target's resolution in
+# the way of every ordinary `cargo build`.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zed_extension_api = "0.7.0"

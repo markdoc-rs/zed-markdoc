@@ -1,0 +1,19 @@
+id = "markdoc-ls"
+name = "Markdoc"
+description = "Diagnostics, completion and navigation for Markdoc documents, from markdoc-ls"
+version = "0.1.0"
+schema_version = 1
+authors = ["JJTC"]
+
+# No grammar of its own.
+#
+# This attaches the server to Zed's built-in Markdown language rather than
+# defining a Markdoc one: `.md` is what the corpus is. That grammar has no
+# rule for `{% %}` tags. What colours a tag is the server's semantic tokens,
+# computed by the same parser that produces the diagnostics -- and Zed only
+# requests those once the writer turns them on (`"semantic_tokens":
+# "combined"` for Markdown; README.md has the setting). What a tag means and
+# whether it resolves comes from the server either way.
+[language_servers.markdoc-ls]
+name = "markdoc-ls"
+languages = ["Markdown"]

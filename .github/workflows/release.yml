@@ -1,0 +1,157 @@
+# Release workflow for zed-markdoc
+#
+# Triggered by pushing a SemVer tag without a `v` prefix (e.g. `0.2.0`),
+# matching the convention the sibling repos use.
+#
+# A Zed extension is a single WebAssembly component, so unlike the
+# `markdoc-ls` release, which publishes one bare binary per platform (four,
+# each with a `.sha256` beside it), there is one artifact here: the same
+# wasm runs on every platform Zed does. It is built once, recorded with a
+# GitHub build-provenance attestation, and published to a GitHub release
+# together with the manifest and a SHA256SUMS file.
+#
+# The archive is installable as it stands. Unpacked, `zed-markdoc-<tag>/`
+# holds `extension.toml` and the component as `extension.wasm`; point Zed's
+# "Install Dev Extension" at that directory. With no Cargo.toml there, Zed
+# compiles nothing, finds `extension.wasm` and loads it as the extension (Zed
+# v1.27.0: `ExtensionManifest::populate_defaults` and
+# `ExtensionStore::add_extension_to_index`), so a writer needs no Rust
+# toolchain. cargo names the file after the crate; Zed looks for
+# `extension.wasm`, hence the rename below. The loose `zed_markdoc.wasm` is
+# the same bytes under cargo's name.
+#
+# Verify a downloaded archive with:
+#
+#   gh attestation verify zed-markdoc-<tag>.tar.gz --repo markdoc-rs/zed-markdoc
+#
+# A manual `workflow_dispatch` run builds, checks and attests as a dry run but
+# publishes nothing; only a tag push creates the release.
+#
+# This does not publish to Zed's extension registry. Zed's registry is
+# https://github.com/zed-industries/extensions, which builds the wasm itself
+# from the commit its submodule of this repository points at; publishing
+# there means a PR that bumps that submodule and the version in its
+# `extensions.toml`. See
+# https://zed.dev/docs/extensions/developing-extensions for that flow.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+" # stable:      0.2.0
+      - "[0-9]+.[0-9]+.[0-9]+-*" # pre-release: 0.2.0-rc1, 0.2.0-beta.3
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  WASM_TARGET: wasm32-wasip2
+
+jobs:
+  release:
+    name: Build, attest and publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # creating the release
+      id-token: write # provenance signing
+      attestations: write # recording the attestation
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+
+      # Cargo.toml and extension.toml both carry the version, and a release
+      # where they disagree ships a component labelled with a version nobody
+      # asked for. Runs on every trigger, dry runs included.
+      - name: Check the manifest parses and agrees with Cargo.toml
+        run: python3 -I .github/scripts/check_extension_manifest.py
+
+      # The tag is the version a writer will cite, so a tag that disagrees
+      # with the manifest would publish a mislabelled extension. Exact match:
+      # a pre-release tag needs the pre-release version in both manifests.
+      - name: Check the tag matches extension.toml
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          manifest=$(python3 -I -c 'import tomllib; print(tomllib.load(open("extension.toml","rb"))["version"])')
+          if [[ "$manifest" != "${GITHUB_REF_NAME}" ]]; then
+            echo "error: tag ${GITHUB_REF_NAME} != extension.toml version $manifest" >&2
+            exit 1
+          fi
+          echo "ok: tag and manifest both say $manifest"
+
+      - name: Build the wasm component
+        run: cargo build --locked --release --target "$WASM_TARGET"
+
+      # Nothing compiles the archive's wasm again before Zed loads it, so
+      # what Zed checks on load is checked here first.
+      - name: Check Zed can load the component
+        run: python3 -I .github/scripts/check_wasm_component.py "target/$WASM_TARGET/release/zed_markdoc.wasm"
+
+      - name: Stage archive
+        id: stage
+        run: |
+          set -euo pipefail
+          asset="zed-markdoc-${GITHUB_REF_NAME}"
+          mkdir -p "staging/$asset" dist
+          cp "target/$WASM_TARGET/release/zed_markdoc.wasm" "staging/$asset/extension.wasm"
+          cp extension.toml README.md LICENSE "staging/$asset/"
+          tar czf "dist/$asset.tar.gz" -C staging "$asset"
+          listing=$(tar tzf "dist/$asset.tar.gz")
+          printf '%s\n' "$listing"
+          # Fail here rather than in a writer's editor: these two are what
+          # "Install Dev Extension" needs to find in the unpacked directory.
+          # (The listing is read once, into a variable: piping `tar` into
+          # `grep -q` under pipefail fails whenever grep stops reading first.)
+          for f in extension.toml extension.wasm; do
+            grep -qx "$asset/$f" <<<"$listing" || {
+              echo "error: dist/$asset.tar.gz has no $asset/$f" >&2
+              exit 1
+            }
+          done
+          echo "name=$asset.tar.gz" >> "$GITHUB_OUTPUT"
+
+      # Attests both the archive and the bare wasm: the archive is what a
+      # person downloads, and the wasm is what actually gets loaded.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/${{ steps.stage.outputs.name }}
+            target/${{ env.WASM_TARGET }}/release/zed_markdoc.wasm
+
+      - name: Collect the loose wasm and checksum everything
+        run: |
+          set -euo pipefail
+          cp "target/$WASM_TARGET/release/zed_markdoc.wasm" dist/
+          cd dist
+          sha256sum zed_markdoc.wasm *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: zed-markdoc-release
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Create or update release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

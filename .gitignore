@@ -1,0 +1,4 @@
+target/
+# "Install Dev Extension" on a checkout compiles the crate and writes the
+# component here, beside extension.toml.
+extension.wasm
