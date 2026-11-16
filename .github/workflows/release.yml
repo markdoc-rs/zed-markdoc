@@ -1,16 +1,31 @@
-# Release workflow for zed-markdoc
+# Release workflow for zed-markdoc — https://github.com/markdoc-rs/zed-markdoc
 #
-# Triggered by pushing a SemVer tag without a `v` prefix (e.g. `0.2.0`),
-# matching the convention the sibling repos use.
+# ## How a release happens
+#
+# Cargo.toml's version is the release, as it is in every sibling repository.
+# A push to main that changes Cargo.toml or extension.toml runs this, and
+# when no tag names that version yet it checks the commit, builds the
+# component, and creates the GitHub release and the tag with it. A version a
+# tag already names does nothing; one older than the newest tag fails the run
+# (.github/scripts/release_version.py says why). "Run workflow" does the same
+# on demand, to retry a release that failed. A version with a pre-release
+# part, 0.2.0-rc.1, makes a pre-release, so `releases/latest` stays on the
+# last full release.
+#
+# This replaced a tag-driven release. A pushed tag was one more thing to get
+# right by hand, and the two manifests and the tag could disagree three ways;
+# now the version is read from Cargo.toml, check.sh holds extension.toml to
+# it, and the tag is made from the same answer.
+#
+# ## What it publishes
 #
 # A Zed extension is a single WebAssembly component, so unlike the
-# `markdoc-ls` release, which publishes one bare binary per platform (four,
-# each with a `.sha256` beside it), there is one artifact here: the same
-# wasm runs on every platform Zed does. It is built once, recorded with a
-# GitHub build-provenance attestation, and published to a GitHub release
-# together with the manifest and a SHA256SUMS file.
+# `markdoc-ls` release — one bare binary per platform — there is one artifact
+# here: the same wasm runs on every platform Zed does. It is built once,
+# recorded with a GitHub build-provenance attestation, and published together
+# with the manifest and a SHA256SUMS file.
 #
-# The archive is installable as it stands. Unpacked, `zed-markdoc-<tag>/`
+# The archive is installable as it stands. Unpacked, `zed-markdoc-<version>/`
 # holds `extension.toml` and the component as `extension.wasm`; point Zed's
 # "Install Dev Extension" at that directory. With no Cargo.toml there, Zed
 # compiles nothing, finds `extension.wasm` and loads it as the extension (Zed
@@ -22,40 +37,90 @@
 #
 # Verify a downloaded archive with:
 #
-#   gh attestation verify zed-markdoc-<tag>.tar.gz --repo markdoc-rs/zed-markdoc
+#   gh attestation verify zed-markdoc-<version>.tar.gz --repo markdoc-rs/zed-markdoc
 #
-# A manual `workflow_dispatch` run builds, checks and attests as a dry run but
-# publishes nothing; only a tag push creates the release.
+# ## What it does not publish
 #
-# This does not publish to Zed's extension registry. Zed's registry is
-# https://github.com/zed-industries/extensions, which builds the wasm itself
-# from the commit its submodule of this repository points at; publishing
-# there means a PR that bumps that submodule and the version in its
-# `extensions.toml`. See
+# Zed's registry is https://github.com/zed-industries/extensions, which
+# builds the wasm itself from the commit its submodule of this repository
+# points at; publishing there means a PR that bumps that submodule and the
+# version in its `extensions.toml`. See
 # https://zed.dev/docs/extensions/developing-extensions for that flow.
 
 name: Release
 
 on:
   push:
-    tags:
-      - "[0-9]+.[0-9]+.[0-9]+" # stable:      0.2.0
-      - "[0-9]+.[0-9]+.[0-9]+-*" # pre-release: 0.2.0-rc1, 0.2.0-beta.3
+    branches: [main]
+    paths: [Cargo.toml, extension.toml]
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# One release at a time: two runs deciding at once could both find the
+# version untagged.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   WASM_TARGET: wasm32-wasip2
 
 jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release: ${{ steps.version.outputs.release }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - name: Only main releases
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::${GITHUB_REF} is not main, and only main is released." >&2
+          exit 1
+
+      - uses: actions/checkout@v5
+
+      - name: Cargo.toml's version, and whether a tag names it yet
+        id: version
+        run: python3 -I .github/scripts/release_version.py .
+
+  # ────────────────────────────────────────────────────────────────────
+  # Nothing is published until this passes. Same check.sh ci.yml runs, so
+  # a release cannot hold a build the ordinary gate would have rejected —
+  # including that extension.toml's version agrees with Cargo.toml's.
+  # ────────────────────────────────────────────────────────────────────
+  check:
+    name: Check
+    needs: version
+    if: needs.version.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-check
+
+      - name: check.sh
+        run: bash .github/scripts/check.sh .
+
   release:
     name: Build, attest and publish
+    needs: [version, check]
+    if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
     permissions:
-      contents: write # creating the release
+      contents: write # creating the release and its tag
       id-token: write # provenance signing
       attestations: write # recording the attestation
     steps:
@@ -71,39 +136,16 @@ jobs:
         with:
           key: release
 
-      # Cargo.toml and extension.toml both carry the version, and a release
-      # where they disagree ships a component labelled with a version nobody
-      # asked for. Runs on every trigger, dry runs included.
-      - name: Check the manifest parses and agrees with Cargo.toml
-        run: python3 -I .github/scripts/check_extension_manifest.py
-
-      # The tag is the version a writer will cite, so a tag that disagrees
-      # with the manifest would publish a mislabelled extension. Exact match:
-      # a pre-release tag needs the pre-release version in both manifests.
-      - name: Check the tag matches extension.toml
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          set -euo pipefail
-          manifest=$(python3 -I -c 'import tomllib; print(tomllib.load(open("extension.toml","rb"))["version"])')
-          if [[ "$manifest" != "${GITHUB_REF_NAME}" ]]; then
-            echo "error: tag ${GITHUB_REF_NAME} != extension.toml version $manifest" >&2
-            exit 1
-          fi
-          echo "ok: tag and manifest both say $manifest"
-
       - name: Build the wasm component
         run: cargo build --locked --release --target "$WASM_TARGET"
 
-      # Nothing compiles the archive's wasm again before Zed loads it, so
-      # what Zed checks on load is checked here first.
-      - name: Check Zed can load the component
-        run: python3 -I .github/scripts/check_wasm_component.py "target/$WASM_TARGET/release/zed_markdoc.wasm"
-
       - name: Stage archive
         id: stage
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          asset="zed-markdoc-${GITHUB_REF_NAME}"
+          asset="zed-markdoc-${VERSION}"
           mkdir -p "staging/$asset" dist
           cp "target/$WASM_TARGET/release/zed_markdoc.wasm" "staging/$asset/extension.wasm"
           cp extension.toml README.md LICENSE "staging/$asset/"
@@ -147,11 +189,14 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Create or update release
-        if: startsWith(github.ref, 'refs/tags/')
+      # The tag is made here, on this commit, from the version that was
+      # decided: nothing pushes a tag by hand any more.
+      - name: Create the release, and its tag
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ needs.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
           files: dist/*
           generate_release_notes: true
           fail_on_unmatched_files: true
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ needs.version.outputs.prerelease }}

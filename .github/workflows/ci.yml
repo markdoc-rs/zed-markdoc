@@ -1,4 +1,8 @@
-# CI for zed-markdoc
+# CI for zed-markdoc — https://github.com/markdoc-rs/zed-markdoc
+#
+# The gate itself is in `.github/scripts/check.sh`, not here, so release.yml
+# runs exactly the same set before it publishes anything. A second list of
+# steps drifts, and the half that drifts is always the one nobody watches.
 #
 # Zed loads extensions as WebAssembly components, so the build output is a
 # single host-independent `zed_markdoc.wasm`. There is no per-OS or per-arch
@@ -12,16 +16,9 @@
 # the same file: the wasm embeds the builder's cargo registry paths. (No
 # Intel macOS host is listed: the `macos-13` image is retired.)
 #
-# clippy and build pass `--target wasm32-wasip2` (rustfmt has no target),
-# because that is the target Zed loads. The crate also compiles for the host
-# — `cargo check` with no target succeeds — but a host build is not the
-# component Zed runs, so it proves nothing about it. In the markdoc-tools
-# workspace this crate came from it was not a workspace member, so its gate
-# built it but never ran rustfmt or clippy over it, and it was found
-# unformatted; the `lint` job is what keeps that from recurring.
-#
-# `--locked` everywhere cargo resolves: Cargo.lock is committed, and a build
-# that quietly re-resolved it would not be the build that was reviewed.
+# What check.sh proves about the component — that it is a component at all,
+# and that Zed can read its API version — does not depend on the build host,
+# so it is checked once there rather than five times here.
 
 name: CI
 
@@ -41,8 +38,8 @@ env:
   WASM_TARGET: wasm32-wasip2
 
 jobs:
-  lint:
-    name: Format and clippy
+  check:
+    name: Check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -58,23 +55,11 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: cargo fmt --check
-        run: cargo fmt --all --check
-
-      - name: cargo clippy
-        run: cargo clippy --locked --all-targets --target "$WASM_TARGET" -- -D warnings
-
-  manifest:
-    name: Validate extension.toml
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      # extension.toml is the version Zed shows and resolves; Cargo.toml is
-      # the version cargo builds. The release gate this repository was split
-      # out of checked the two against each other, and this is that check.
-      - name: Check the manifest parses and agrees with Cargo.toml
-        run: python3 -I .github/scripts/check_extension_manifest.py
+      # fmt, the lockfile, clippy for the wasm target, extension.toml
+      # agreeing with Cargo.toml, the release build, and that what came out
+      # is a component Zed can load.
+      - name: check.sh
+        run: bash .github/scripts/check.sh .
 
   build:
     name: Build on ${{ matrix.host }}
@@ -111,6 +96,8 @@ jobs:
         shell: bash
         run: cargo build --locked --release --target "$WASM_TARGET"
 
+      # Host-specific: that this host's toolchain emitted a wasm module at
+      # all. What the module *is* is check.sh's business, once.
       - name: Check the component was produced
         shell: bash
         run: |
@@ -125,12 +112,3 @@ jobs:
             exit 1
           fi
           ls -lh "$wasm"
-
-      # The magic number says "wasm"; Zed asks for more. It loads a component,
-      # not a core module, and reads its API version from a `zed:api-version`
-      # custom section before anything else — see the script. The Windows
-      # images are skipped only because `python3` is not reliably on their
-      # PATH; what this checks does not depend on the build host.
-      - name: Check Zed can load the component
-        if: runner.os != 'Windows'
-        run: python3 -I .github/scripts/check_wasm_component.py "target/$WASM_TARGET/release/zed_markdoc.wasm"
